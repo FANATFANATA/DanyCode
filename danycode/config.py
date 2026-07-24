@@ -11,17 +11,18 @@ SESSIONS_DIR = CONFIG_DIR / "sessions"
 DEFAULTS = {
     "host": "http://localhost:11434",
     "model": "",
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "top_k": 40,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
     "min_p": 0.0,
     "num_ctx": 8192,
     "num_predict": 4096,
-    "seed": -1,
+    "seed": 1,
     "think": "false",
     "keep_alive": "5m",
     "system_prompt": "Coding assistant. Use tools. Be concise.",
     "mode": "ask",
+    "tool_result_limit": 500,
 }
 
 VALID_MODES = ("yolo", "ask")
@@ -43,16 +44,20 @@ class Config:
     keep_alive: str = DEFAULTS["keep_alive"]
     system_prompt: str = DEFAULTS["system_prompt"]
     mode: str = DEFAULTS["mode"]
+    tool_result_limit: int = DEFAULTS["tool_result_limit"]
 
     @classmethod
     def load(cls, overrides: dict | None = None) -> Config:
         data = dict(DEFAULTS)
         if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "rb") as f:
-                file_cfg = tomllib.load(f)
-            for key in DEFAULTS:
-                if key in file_cfg:
-                    data[key] = file_cfg[key]
+            try:
+                with open(CONFIG_FILE, "rb") as f:
+                    file_cfg = tomllib.load(f)
+                for key in DEFAULTS:
+                    if key in file_cfg:
+                        data[key] = file_cfg[key]
+            except Exception:
+                pass
         if overrides:
             for key, val in overrides.items():
                 if val is not None:
@@ -136,6 +141,14 @@ class Config:
             self.host = value
         elif key == "system_prompt":
             self.system_prompt = value
+        elif key == "tool_result_limit":
+            try:
+                v = int(value)
+                if v <= 0:
+                    return "tool_result_limit must be positive"
+                self.tool_result_limit = v
+            except ValueError:
+                return "tool_result_limit must be an integer"
         return None
 
     def save(self) -> None:
@@ -143,7 +156,12 @@ class Config:
         for f in fields(self):
             val = getattr(self, f.name)
             if isinstance(val, str):
-                escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+                escaped = (
+                    val.replace("\\", "\\\\")
+                    .replace('"', '\\"')
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                )
                 lines.append(f'{f.name} = "{escaped}"')
             elif isinstance(val, float):
                 lines.append(f"{f.name} = {val}")
@@ -165,9 +183,6 @@ class Config:
             ("think", self.think),
             ("keep_alive", self.keep_alive),
             ("mode", self.mode),
-            (
-                "system_prompt",
-                self.system_prompt[:80]
-                + ("..." if len(self.system_prompt) > 80 else ""),
-            ),
+            ("tool_result_limit", str(self.tool_result_limit)),
+            ("system_prompt", self.system_prompt[:80] + ("..." if len(self.system_prompt) > 80 else "")),
         ]

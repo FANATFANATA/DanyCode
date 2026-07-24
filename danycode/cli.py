@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
+import time
+from urllib.parse import urlparse
 
 import typer
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.table import Table
 
 from danycode.agent import Agent
@@ -14,10 +22,39 @@ from danycode.client import OllamaClient
 from danycode.config import Config
 from danycode.session import Session
 
-app = typer.Typer(
-    name="danycode", help="Ollama CLI coding assistant", invoke_without_command=True
-)
 console = Console()
+
+COMMANDS = [
+    "/quit",
+    "/clear",
+    "/sessions",
+    "/models",
+    "/model",
+    "/ps",
+    "/config",
+    "/set",
+    "/save",
+    "/version",
+    "/help",
+]
+
+
+class CommandCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith("/"):
+            word = text.split()[0] if text.split() else text
+            for cmd in COMMANDS:
+                if cmd.startswith(word):
+                    yield Completion(cmd, start_position=-len(word))
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes >= 1_000_000_000:
+        return f"{size_bytes / 1_000_000_000:.1f} GB"
+    if size_bytes >= 1_000_000:
+        return f"{size_bytes / 1_000_000:.0f} MB"
+    return f"{size_bytes} B"
 
 
 def _build_config(
@@ -34,6 +71,7 @@ def _build_config(
     keep_alive: str | None,
     system_prompt: str | None,
     mode: str | None,
+    tool_result_limit: int | None,
 ) -> Config:
     overrides = {
         "model": model,
@@ -49,39 +87,118 @@ def _build_config(
         "keep_alive": keep_alive,
         "system_prompt": system_prompt,
         "mode": mode,
+        "tool_result_limit": tool_result_limit,
     }
     return Config.load(overrides)
 
 
-def _check_ollama(config: Config) -> None:
-    client = OllamaClient(config)
-    ok = asyncio.run(client.health())
-    if not ok:
-        console.print(f"[bold red]Ollama is not reachable at {config.host}[/bold red]")
-        console.print("Start it with: [dim]ollama serve[/dim]")
+def _normalize_host(raw: str) -> str:
+    raw = raw.strip()
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    if not parsed.port:
+        return f"{parsed.scheme}://{parsed.hostname}:11434"
+    return raw
+
+
+def _setup_remote(config: Config) -> None:
+    try:
+        raw = input("Адрес сервера (IP или host, порт опционально): ").strip()
+    except (EOFError, KeyboardInterrupt):
         raise typer.Exit(1)
+    if not raw:
+        raise typer.Exit(1)
+    config.host = _normalize_host(raw)
+    client = OllamaClient(config)
+    if asyncio.run(client.health()):
+        console.print(f"[green]Подключено к {config.host}[/green]")
+    else:
+        console.print(
+            Panel(
+                f"Не удалось подключиться к {config.host}",
+                border_style="red",
+                box=box.SQUARE,
+            )
+        )
+        raise typer.Exit(1)
+
+
+def _wait_for_local(config: Config) -> None:
+    console.print("Запустите [bold]ollama serve[/bold] в отдельном терминале.")
+    client = OllamaClient(config)
+    with console.status("[dim]Ожидание Ollama (до 5 минут)...[/dim]"):
+        for _ in range(60):
+            if asyncio.run(client.health()):
+                console.print("[green]Ollama запущена.[/green]")
+                return
+            time.sleep(5)
+    console.print(
+        Panel("Ollama не запустилась за 5 минут.", border_style="red", box=box.SQUARE)
+    )
+    raise typer.Exit(1)
+
+
+def _ensure_ollama(config: Config) -> None:
+    client = OllamaClient(config)
+    if asyncio.run(client.health()):
+        return
+    console.print(
+        Panel(
+            f"Ollama не доступна по адресу {config.host}",
+            border_style="yellow",
+            box=box.SQUARE,
+        )
+    )
+    try:
+        choice = input("Сервер локально или удалённо? [local/remote]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise typer.Exit(1)
+    if choice.startswith("r"):
+        _setup_remote(config)
+    else:
+        _wait_for_local(config)
+
+
+def _check_model_tools(config: Config) -> None:
+    if not config.model:
+        return
+    client = OllamaClient(config)
+    try:
+        info = asyncio.run(client.show_model(config.model))
+        caps = info.get("capabilities", [])
+        if "tools" not in caps:
+            console.print(
+                f"[yellow]Warning: {config.model} may not support tool calling.[/yellow]"
+            )
+    except Exception:
+        pass
 
 
 def _auto_select_model(config: Config) -> None:
     client = OllamaClient(config)
-    models = asyncio.run(client.list_models())
+    models = asyncio.run(client.list_models_with_tools())
     if not models:
         console.print(
-            "[bold red]No models available. Pull one: ollama pull qwen3:8b[/bold red]"
+            Panel(
+                "No models with tool calling available.\nPull one: ollama pull qwen3:8b",
+                border_style="red",
+                box=box.SQUARE,
+            )
         )
         raise typer.Exit(1)
     lightest = min(models, key=lambda m: m.get("size", float("inf")))
     config.model = lightest["name"]
-    console.print(f"[dim]Auto-selected lightest model: {config.model}[/dim]")
+    console.print(f"[dim]Auto-selected: {config.model}[/dim]")
 
 
 def _print_models(config: Config) -> list[dict]:
     client = OllamaClient(config)
-    models = asyncio.run(client.list_models())
+    models = asyncio.run(client.list_models_with_tools())
     if not models:
-        console.print("[dim]No models found.[/dim]")
+        console.print("[dim]No models with tool calling found.[/dim]")
         return []
-    table = Table(title="Available Models")
+    table = Table(title="Models (tool calling)", box=box.SQUARE)
     table.add_column("#", style="dim", width=4)
     table.add_column("Name", style="cyan")
     table.add_column("Params", style="green")
@@ -94,8 +211,7 @@ def _print_models(config: Config) -> list[dict]:
         params = details.get("parameter_size", "-")
         quant = details.get("quantization_level", "-")
         family = details.get("family", "-")
-        size_bytes = m.get("size", 0)
-        size = f"{size_bytes / 1e9:.1f} GB" if size_bytes else "-"
+        size = _format_size(m.get("size", 0))
         table.add_row(str(i), name, params, quant, family, size)
     console.print(table)
     return models
@@ -107,7 +223,7 @@ def _print_running(config: Config) -> None:
     if not models:
         console.print("[dim]No running models.[/dim]")
         return
-    table = Table(title="Running Models")
+    table = Table(title="Running Models", box=box.SQUARE)
     table.add_column("Name", style="cyan")
     table.add_column("VRAM", style="green")
     table.add_column("Context", style="yellow")
@@ -115,7 +231,7 @@ def _print_running(config: Config) -> None:
     for m in models:
         name = m.get("name", "?")
         vram = m.get("size_vram", 0)
-        vram_str = f"{vram / 1e9:.1f} GB" if vram else "-"
+        vram_str = _format_size(vram) if vram else "-"
         ctx = str(m.get("context_length", "-"))
         expires = m.get("expires_at", "")[:19]
         table.add_row(name, vram_str, ctx, expires)
@@ -146,10 +262,10 @@ def _select_model(config: Config) -> None:
     if not models:
         return
     try:
-        choice = Prompt.ask(f"Select model [1-{len(models)}]", default="")
+        choice = input(f"Select model [1-{len(models)}]: ").strip()
     except (EOFError, KeyboardInterrupt):
         return
-    if not choice.strip():
+    if not choice:
         return
     try:
         idx = int(choice) - 1
@@ -180,7 +296,7 @@ def _handle_set(config: Config, args: str) -> None:
 
 
 def _print_config(config: Config) -> None:
-    table = Table(title="Current Config")
+    table = Table(title="Current Config", box=box.SQUARE)
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="green")
     for key, val in config.display():
@@ -195,6 +311,116 @@ def _print_version(config: Config) -> None:
         console.print(f"Ollama version: [green]{ver}[/green]")
     except Exception:
         console.print("[red]Failed to get version.[/red]")
+
+
+def _print_help() -> None:
+    help_text = (
+        "[bold]Commands:[/bold]\n"
+        "  /quit              Exit\n"
+        "  /clear             Clear session\n"
+        "  /sessions          List sessions\n"
+        "  /models            List models (tool calling)\n"
+        "  /model             Select model\n"
+        "  /ps                Running models\n"
+        "  /config            Show config\n"
+        "  /set <k> <v>       Set parameter\n"
+        "  /save              Save config\n"
+        "  /version           Ollama version\n"
+        "  /help              This help\n\n"
+        "[bold]Input:[/bold]\n"
+        "  Enter                Send\n"
+        "  Ctrl+J / Alt+Enter   Newline\n"
+        "  Tab                  Toggle mode (yolo/ask)\n"
+        "  //text               Send to model as-is"
+    )
+    console.print(Panel(help_text, border_style="green", box=box.SQUARE, title="Help"))
+
+
+def _run_agent(agent: Agent, text: str) -> None:
+    try:
+        asyncio.run(agent.run(text))
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted.[/dim]")
+    except Exception as e:
+        console.print(Panel(str(e), border_style="red", box=box.SQUARE))
+
+
+def _clear_prompt_line(text: str) -> None:
+    lines = text.count("\n") + 1
+    sys.stdout.write(f"\x1b[{lines}A\x1b[J")
+    sys.stdout.flush()
+
+
+def _build_status_bar(config: Config, agent: Agent | None) -> str:
+    mode_color = "ansired" if config.mode == "yolo" else "ansigreen"
+    parts = [f"<{mode_color}><b> {config.mode} </b></{mode_color}>"]
+    parts.append(f" {config.model} ")
+
+    if agent and agent.last_prompt_tokens > 0:
+        pct = agent.last_prompt_tokens / config.num_ctx * 100
+        if pct > 95:
+            tok_color = "ansired"
+        elif pct > 80:
+            tok_color = "ansiyellow"
+        else:
+            tok_color = "ansigreen"
+        parts.append(
+            f"<{tok_color}> ctx: {agent.last_prompt_tokens}/{config.num_ctx} ({pct:.0f}%) </{tok_color}>"
+        )
+    else:
+        parts.append(f" ctx: 0/{config.num_ctx} (0%) ")
+
+    return " │ ".join(parts)
+
+
+def _build_rprompt(config: Config, agent: Agent | None) -> HTML:
+    return HTML(_build_status_bar(config, agent))
+
+
+def _build_key_bindings(config: Config) -> KeyBindings:
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _submit(event):
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("c-j")
+    def _newline_cj(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("escape", "enter")
+    def _newline_alt(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("tab")
+    def _toggle_mode(event):
+        config.mode = "ask" if config.mode == "yolo" else "yolo"
+
+    return kb
+
+
+def _build_prompt_session(config: Config, agent: Agent) -> PromptSession:
+    style = Style.from_dict(
+        {
+            "prompt": "bold ansigreen",
+            "rprompt": "#888888",
+        }
+    )
+    return PromptSession(
+        message=HTML("<ansigreen><b>❯</b></ansigreen> "),
+        multiline=True,
+        key_bindings=_build_key_bindings(config),
+        completer=CommandCompleter(),
+        complete_while_typing=True,
+        rprompt=lambda: _build_rprompt(config, agent),
+        style=style,
+        prompt_continuation="  ",
+    )
+
+
+app = typer.Typer(
+    name="danycode", help="Ollama CLI coding assistant", invoke_without_command=True
+)
 
 
 @app.callback(invoke_without_command=True)
@@ -217,6 +443,7 @@ def main(
     keep_alive: str = typer.Option(None, "--keep-alive"),
     system_prompt: str = typer.Option(None, "--system", help="System prompt."),
     mode: str = typer.Option(None, "--mode", help="yolo or ask."),
+    tool_result_limit: int = typer.Option(None, "--tool-result-limit"),
     new: bool = typer.Option(False, "--new", "-n", help="Start fresh session."),
 ):
     if ctx.invoked_subcommand is not None:
@@ -236,12 +463,15 @@ def main(
         keep_alive,
         system_prompt,
         mode,
+        tool_result_limit,
     )
     config.ensure_dirs()
-    _check_ollama(config)
+    _ensure_ollama(config)
 
     if not config.model:
         _auto_select_model(config)
+    else:
+        _check_model_tools(config)
 
     session = Session(session_name)
     if new:
@@ -250,31 +480,26 @@ def main(
     agent = Agent(config, session)
 
     if prompt:
-        asyncio.run(agent.run(prompt))
+        _run_agent(agent, prompt)
         return
 
     os.system("cls" if os.name == "nt" else "clear")
+    console.print("[bold green]DanyCode[/bold green] [dim]│ /help - help[/dim]")
 
-    console.print(
-        Panel(
-            f"[bold]DanyCode[/bold] | model: {config.model} | mode: {config.mode} | session: {session_name}\n"
-            f"[dim]/quit /clear /sessions /models /model /ps /config /set <k> <v> /save /version[/dim]\n"
-            f"[dim]// at start of message sends it to model as-is[/dim]",
-            border_style="green",
-        )
-    )
+    ps = _build_prompt_session(config, agent)
 
     while True:
         try:
-            user_input = Prompt.ask("\n[bold green]You[/bold green]")
+            user_input = ps.prompt()
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
 
+        _clear_prompt_line(user_input)
         stripped = user_input.strip()
 
         if stripped.startswith("//"):
-            asyncio.run(agent.run(stripped[1:]))
+            _run_agent(agent, stripped[1:])
             continue
 
         if stripped.startswith("/"):
@@ -305,6 +530,8 @@ def main(
                 console.print("[green]Config saved.[/green]")
             elif cmd == "/version":
                 _print_version(config)
+            elif cmd == "/help":
+                _print_help()
             else:
                 console.print(f"[red]Unknown command: {cmd}[/red]")
             continue
@@ -312,7 +539,7 @@ def main(
         if not stripped:
             continue
 
-        asyncio.run(agent.run(stripped))
+        _run_agent(agent, stripped)
 
 
 @app.command()
@@ -320,9 +547,22 @@ def models(
     host: str = typer.Option(None, "--host", help="Ollama API base URL."),
 ):
     config = _build_config(
-        None, host, None, None, None, None, None, None, None, None, None, None, None
+        None,
+        host,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
-    _check_ollama(config)
+    _ensure_ollama(config)
     _print_models(config)
 
 

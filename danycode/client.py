@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import AsyncIterator
 
@@ -36,6 +37,20 @@ class OllamaClient:
             resp = await client.get(f"{self.base_url}/api/tags")
             resp.raise_for_status()
             return resp.json().get("models", [])
+
+    async def list_models_with_tools(self) -> list[dict]:
+        models = await self.list_models()
+
+        async def _check(m: dict) -> dict:
+            try:
+                info = await self.show_model(m["name"])
+                m["capabilities"] = info.get("capabilities", [])
+            except Exception:
+                m["capabilities"] = []
+            return m
+
+        checked = await asyncio.gather(*[_check(m) for m in models])
+        return [m for m in checked if "tools" in m.get("capabilities", [])]
 
     async def list_running(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -97,4 +112,7 @@ class OllamaClient:
                 async for line in resp.aiter_lines():
                     stripped = line.strip()
                     if stripped:
-                        yield json.loads(stripped)
+                        try:
+                            yield json.loads(stripped)
+                        except json.JSONDecodeError:
+                            continue
