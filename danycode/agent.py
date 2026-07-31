@@ -76,7 +76,7 @@ class Agent:
         display = result
         if len(display) > self.config.tool_result_limit:
             display = display[: self.config.tool_result_limit] + "..."
-        console.print(f"[green]\\[{fn_name} →] {display}[/green]")
+        console.print(f"[green]\\[{fn_name} ->] {display}[/green]")
 
     def _print_request(self, text: str) -> None:
         console.print(
@@ -120,6 +120,20 @@ class Agent:
         last_content = None
         has_response = False
 
+        def stop_on_repeat(sig: str, mark: int) -> bool:
+            recent_sigs.append(sig)
+            if len(recent_sigs) > REPEAT_THRESHOLD:
+                recent_sigs.pop(0)
+            if (
+                len(recent_sigs) == REPEAT_THRESHOLD
+                and len(set(recent_sigs)) == 1
+            ):
+                del self.session.messages[mark:]
+                self.session.save()
+                self._print_error("Repeated identical tool call. Stopping.")
+                return True
+            return False
+
         while True:
             iterations += 1
             if iterations > MAX_ITERATIONS:
@@ -139,44 +153,58 @@ class Agent:
             turn_eval_tokens += self.last_eval_tokens
 
             if assistant_msg.get("tool_calls"):
+                mark = len(self.session.messages)
                 self.session.add(
                     {k: v for k, v in assistant_msg.items() if not k.startswith("_")}
                 )
 
                 for tc in assistant_msg["tool_calls"]:
-                    fn_name = tc["function"]["name"]
-                    fn_args = tc["function"]["arguments"]
+                    func = tc.get("function") if isinstance(tc, dict) else None
+                    if not isinstance(func, dict):
+                        sig = json.dumps(tc, sort_keys=True, default=str)
+                        if stop_on_repeat(sig, mark):
+                            return
+                        result = json.dumps({"error": f"Malformed tool call: {tc!r}"})
+                        self.session.add({"role": "tool", "content": result})
+                        continue
+                    fn_name = func.get("name", "")
+                    fn_args = func.get("arguments", {})
+                    if not fn_name:
+                        sig = json.dumps(
+                            {"n": "", "a": func}, sort_keys=True, default=str
+                        )
+                        if stop_on_repeat(sig, mark):
+                            return
+                        result = json.dumps({"error": f"Malformed tool call: {tc!r}"})
+                        self.session.add({"role": "tool", "content": result})
+                        continue
 
                     sig = json.dumps({"n": fn_name, "a": fn_args}, sort_keys=True)
-                    recent_sigs.append(sig)
-                    if len(recent_sigs) > REPEAT_THRESHOLD:
-                        recent_sigs.pop(0)
-                    if (
-                        len(recent_sigs) == REPEAT_THRESHOLD
-                        and len(set(recent_sigs)) == 1
-                    ):
-                        self._print_error("Repeated identical tool call. Stopping.")
-                        self.session.add(
-                            {
-                                "role": "tool",
-                                "content": json.dumps(
-                                    {"error": "Repeated identical tool call detected."}
-                                ),
-                            }
-                        )
+                    if stop_on_repeat(sig, mark):
                         return
 
                     if self.config.mode == "ask" and fn_name != "ask_user":
                         if not self._confirm_inline(fn_name, fn_args):
                             result = json.dumps({"error": "User denied tool execution"})
-                            self.session.add({"role": "tool", "content": result})
+                            self.session.add(
+                                {
+                                    "role": "tool",
+                                    "content": result,
+                                    "tool_name": fn_name,
+                                }
+                            )
                             continue
-                    else:
-                        self._print_tool_call(fn_name, fn_args)
 
-                    result = execute_tool(fn_name, fn_args, self._ask_user)
+                    self._print_tool_call(fn_name, fn_args)
+
+                    try:
+                        result = execute_tool(fn_name, fn_args, self._ask_user)
+                    except Exception as e:
+                        result = json.dumps({"error": str(e)})
                     self._print_tool_result(fn_name, result)
-                    self.session.add({"role": "tool", "content": result})
+                    self.session.add(
+                        {"role": "tool", "content": result, "tool_name": fn_name}
+                    )
             else:
                 self.session.add(
                     {k: v for k, v in assistant_msg.items() if not k.startswith("_")}

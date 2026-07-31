@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -28,6 +29,45 @@ DEFAULTS = {
 VALID_MODES = ("yolo", "ask")
 VALID_THINK = ("false", "true", "high", "medium", "low", "max")
 
+_FLOAT_RANGES = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.0, 1.0),
+    "min_p": (0.0, 1.0),
+}
+
+_INT_MIN = {
+    "top_k": 0,
+    "num_ctx": 1,
+    "num_predict": 1,
+    "seed": None,
+    "tool_result_limit": 1,
+}
+
+
+def _warn(message: str) -> None:
+    print(f"[danycode] {message}", file=sys.stderr)
+
+
+def _validated_value(key: str, raw) -> tuple[bool, object]:
+    if key in _FLOAT_RANGES:
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return False, None
+        value = float(raw)
+        lo, hi = _FLOAT_RANGES[key]
+        return (lo <= value <= hi), value
+    if key in _INT_MIN:
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            return False, None
+        lo = _INT_MIN[key]
+        return (lo is None or raw >= lo), raw
+    if key == "think":
+        return (isinstance(raw, str) and raw in VALID_THINK), raw
+    if key == "mode":
+        return (isinstance(raw, str) and raw in VALID_MODES), raw
+    if key in ("host", "model", "keep_alive", "system_prompt"):
+        return isinstance(raw, str), raw
+    return False, None
+
 
 @dataclass
 class Config:
@@ -53,15 +93,28 @@ class Config:
             try:
                 with open(CONFIG_FILE, "rb") as f:
                     file_cfg = tomllib.load(f)
-                for key in DEFAULTS:
-                    if key in file_cfg:
-                        data[key] = file_cfg[key]
-            except Exception:
-                pass
+            except Exception as e:
+                file_cfg = {}
+                _warn(f"Failed to read {CONFIG_FILE}: {e}")
+            for key in DEFAULTS:
+                if key not in file_cfg:
+                    continue
+                ok, value = _validated_value(key, file_cfg[key])
+                if ok:
+                    data[key] = value
+                else:
+                    _warn(
+                        f"Ignoring invalid config value for '{key}': {file_cfg[key]!r}"
+                    )
         if overrides:
             for key, val in overrides.items():
-                if val is not None:
-                    data[key] = val
+                if val is None or key not in DEFAULTS:
+                    continue
+                ok, value = _validated_value(key, val)
+                if ok:
+                    data[key] = value
+                else:
+                    _warn(f"Ignoring invalid override for '{key}': {val!r}")
         return cls(**data)
 
     def ensure_dirs(self) -> None:
@@ -152,6 +205,7 @@ class Config:
         return None
 
     def save(self) -> None:
+        self.ensure_dirs()
         lines = []
         for f in fields(self):
             val = getattr(self, f.name)
@@ -170,6 +224,9 @@ class Config:
         CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def display(self) -> list[tuple[str, str]]:
+        sp = self.system_prompt
+        if len(sp) > 80:
+            sp = sp[:80] + "..."
         return [
             ("host", self.host),
             ("model", self.model or "(auto)"),
@@ -184,5 +241,5 @@ class Config:
             ("keep_alive", self.keep_alive),
             ("mode", self.mode),
             ("tool_result_limit", str(self.tool_result_limit)),
-            ("system_prompt", self.system_prompt[:80] + ("..." if len(self.system_prompt) > 80 else "")),
+            ("system_prompt", sp),
         ]

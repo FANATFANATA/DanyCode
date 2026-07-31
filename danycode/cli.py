@@ -449,6 +449,13 @@ def main(
     if ctx.invoked_subcommand is not None:
         return
 
+    if prompt == "models":
+        models(host=host)
+        return
+    if prompt == "sessions":
+        sessions()
+        return
+
     config = _build_config(
         model,
         host,
@@ -484,7 +491,7 @@ def main(
         return
 
     os.system("cls" if os.name == "nt" else "clear")
-    console.print("[bold green]DanyCode[/bold green] [dim]│ /help - help[/dim]")
+    console.print("[bold green]DanyCode[/bold green] [dim]| /help - help[/dim]")
 
     ps = _build_prompt_session(config, agent)
 
@@ -546,22 +553,7 @@ def main(
 def models(
     host: str = typer.Option(None, "--host", help="Ollama API base URL."),
 ):
-    config = _build_config(
-        None,
-        host,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+    config = _build_config(host=host)
     _ensure_ollama(config)
     _print_models(config)
 

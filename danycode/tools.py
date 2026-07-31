@@ -153,21 +153,29 @@ def _clean_output(text: str) -> str:
     return text.strip()
 
 
-def execute_tool(name: str, arguments: dict, ask_fn=None) -> str:
+def execute_tool(name: str, arguments, ask_fn=None) -> str:
+    if not isinstance(arguments, dict):
+        arguments = {}
     if name == "read_file":
-        return _read_file(arguments["path"])
+        return _read_file(arguments.get("path", ""))
     elif name == "write_file":
-        return _write_file(arguments["path"], arguments["content"])
+        return _write_file(arguments.get("path", ""), arguments.get("content", ""))
     elif name == "edit_file":
-        return _edit_file(arguments["path"], arguments["search"], arguments["replace"])
+        return _edit_file(
+            arguments.get("path", ""),
+            arguments.get("search", ""),
+            arguments.get("replace", ""),
+        )
     elif name == "list_dir":
-        return _list_dir(arguments["path"])
+        return _list_dir(arguments.get("path", "."))
     elif name == "search":
         return _search(
-            arguments["pattern"], arguments.get("path", "."), arguments.get("include")
+            arguments.get("pattern", ""),
+            arguments.get("path", "."),
+            arguments.get("include"),
         )
     elif name == "run_command":
-        return _run_command(arguments["command"])
+        return _run_command(arguments.get("command", ""))
     elif name == "ask_user":
         if ask_fn:
             return ask_fn(arguments.get("question", ""))
@@ -176,17 +184,24 @@ def execute_tool(name: str, arguments: dict, ask_fn=None) -> str:
 
 
 def _read_file(path: str) -> str:
+    if not path:
+        return json.dumps({"error": "read_file: path is required"})
     try:
         p = Path(path)
         if not p.exists():
             return json.dumps({"error": f"File not found: {path}"})
-        content = p.read_text(encoding="utf-8")
+        try:
+            content = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return json.dumps({"error": f"File is not valid UTF-8 text: {path}"})
         return json.dumps({"content": content})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 def _write_file(path: str, content: str) -> str:
+    if not path:
+        return json.dumps({"error": "write_file: path is required"})
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -197,6 +212,10 @@ def _write_file(path: str, content: str) -> str:
 
 
 def _edit_file(path: str, search: str, replace: str) -> str:
+    if not path:
+        return json.dumps({"error": "edit_file: path is required"})
+    if not search:
+        return json.dumps({"error": "edit_file: search is required"})
     try:
         p = Path(path)
         if not p.exists():
@@ -231,6 +250,8 @@ def _list_dir(path: str) -> str:
 
 
 def _search(pattern: str, path: str, include: str | None) -> str:
+    if not pattern:
+        return json.dumps({"error": "search: pattern is required"})
     try:
         shell = get_shell()
         if shell:
@@ -261,6 +282,8 @@ def _search(pattern: str, path: str, include: str | None) -> str:
 
 
 def _run_command(command: str) -> str:
+    if not command.strip():
+        return json.dumps({"error": "run_command: command is required"})
     try:
         shell = get_shell()
         if shell:
